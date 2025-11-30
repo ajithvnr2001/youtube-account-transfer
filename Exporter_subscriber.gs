@@ -6,9 +6,8 @@
  * 1. Reads the Master Sheet from the Importer.
  * 2. Checks which channels you are missing.
  * 3. Subscribes you to them.
- * 4. [NEW] QUOTA PROTECTION: Saves position if daily limit reached.
- * 5. [NEW] TIME PROTECTION: Saves position if 6-minute limit reached.
- * 6. [NEW] AUTO-RESUME: Automatically picks up where it left off.
+ * 4. [FIXED] STRICT QUOTA GUARD: Ensures bookmark is NEVER lost on Quota error.
+ * 5. [FIXED] GLOBAL CHECK: Detects quota failure before loop starts.
  */
 
 function setupExporter() {
@@ -17,15 +16,15 @@ function setupExporter() {
   // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
   if (SHEET_ID.includes("PASTE")) {
-    throw new Error("❌ STOP: Paste the Sheet ID in line 18 first.");
+    throw new Error("❌ STOP: Paste the Sheet ID in line 16 first.");
   }
 
   PropertiesService.getScriptProperties().setProperty('TARGET_SHEET_ID', SHEET_ID);
   
-  // Reset any previous progress to start fresh
+  // Only reset if explicitly running setup
   PropertiesService.getScriptProperties().deleteProperty('LAST_PROCESSED_INDEX');
   
-  createMinuteTrigger('runExporterSync');
+  createHourlyTrigger('runExporterSync');
   
   console.log("✅ SETUP COMPLETE. Starting export process...");
   runExporterSync();
@@ -36,51 +35,53 @@ function runExporterSync() {
   if (!sheetId) return console.error("❌ Run setupExporter first.");
 
   // --- STATE MANAGEMENT ---
-  // We track "Index", which corresponds to the row number in the list
-  // If this exists, it means we are resuming from a previous run (Quota or Time limit)
   let lastProcessedIndex = parseInt(PropertiesService.getScriptProperties().getProperty('LAST_PROCESSED_INDEX') || "0");
   
-  if (lastProcessedIndex > 0) {
-    console.log(`🔄 RESUMING Sync from Channel #${lastProcessedIndex}...`);
-  } else {
-    console.log(`▶️ STARTING Sync from the beginning...`);
-  }
+  console.log(`🔎 Checking status. Current Bookmark: #${lastProcessedIndex}`);
 
   try {
     // 1. Load Data from Sheet
     const sheet = SpreadsheetApp.openById(sheetId).getSheets()[0];
     const data = sheet.getRange("A2:A" + sheet.getLastRow()).getValues();
-    
-    // Filter valid IDs (Remove empty rows or bad data)
     const allTargetIds = data.flat().filter(id => id && id.toString().startsWith("UC"));
     
-    // Check if we are already done
+    // 2. GLOBAL QUOTA CHECK (Crucial Step)
+    // We try to fetch current subs first. If this fails due to Quota, we MUST STOP.
+    // We cannot proceed, or we risk resetting the index erroneously.
+    let myCurrentSubs;
+    try {
+      console.log("Checking current subscriptions...");
+      myCurrentSubs = new Set(fetchMyCurrentSubIds());
+    } catch (e) {
+      if (e.message.includes('quota')) {
+        console.error("🛑 DAILY QUOTA EXCEEDED (During Pre-check)!");
+        console.error(`Frozen at #${lastProcessedIndex}. Sleeping until tomorrow.`);
+        return; // STOP HERE. Do not touch the bookmark.
+      }
+      throw e; // Throw other errors
+    }
+
+    // 3. Check if done (Only if Quota check passed)
     if (lastProcessedIndex >= allTargetIds.length) {
-      // Optional: Reset to 0 to check for new additions next time, 
-      // or just log that we are waiting. Let's reset to allow continuous updates.
-      console.log("✅ All channels processed. Resetting to start to check for new additions...");
+      console.log(`✅ All ${allTargetIds.length} channels processed. Resetting to 0 to check for new additions...`);
       PropertiesService.getScriptProperties().deleteProperty('LAST_PROCESSED_INDEX');
       return;
     }
 
-    // 2. Fetch My Current Subs (To skip what we already have)
-    // We do this every run to ensure accuracy and save quota
-    console.log("Checking current subscriptions...");
-    const myCurrentSubs = new Set(fetchMyCurrentSubIds());
+    console.log(`▶️ Processing channels from #${lastProcessedIndex} to #${allTargetIds.length}...`);
 
-    // 3. Processing Loop
+    // 4. Processing Loop
     let successCount = 0;
     const MAX_RUN_TIME = 280000; // 4.5 mins safety buffer
     const startTime = new Date().getTime();
 
-    // Loop starting from our saved index
     for (let i = lastProcessedIndex; i < allTargetIds.length; i++) {
       
       // -- TIME SAFETY CHECK --
       if (new Date().getTime() - startTime > MAX_RUN_TIME) {
         console.warn(`⏳ Time limit reached. Saving position at #${i}`);
         PropertiesService.getScriptProperties().setProperty('LAST_PROCESSED_INDEX', i.toString());
-        return; // Stop and wait for next trigger
+        return; 
       }
 
       const channelId = allTargetIds[i];
@@ -98,35 +99,39 @@ function runExporterSync() {
         
         successCount++;
         console.log(`[${i + 1}/${allTargetIds.length}] Subscribed to: ${channelId}`);
-        Utilities.sleep(500); // Polite delay to prevent rate limiting
+        Utilities.sleep(500); 
 
       } catch (e) {
         // == CRITICAL QUOTA HANDLER ==
         if (e.message.includes('quota')) {
-          console.error("🛑 DAILY QUOTA EXCEEDED!");
-          console.error(`Saving position at #${i}. Will resume tomorrow automatically.`);
+          console.error("🛑 DAILY QUOTA EXCEEDED (During Subscribe)!");
+          console.error(`Saving position at #${i}. Will resume tomorrow.`);
           
-          // Save the exact index where we failed so we retry THIS ONE tomorrow
+          // Save the exact index where we failed
           PropertiesService.getScriptProperties().setProperty('LAST_PROCESSED_INDEX', i.toString());
-          return; // STOP EXECUTION COMPLETELY
+          return; // STOP EXECUTION
         }
         
-        // Log other errors (like "channel not found") but keep going
         console.error(`Failed to add ${channelId}: ${e.message}`);
       }
     }
 
     // If loop finishes successfully
     console.log(`✅ Batch Complete. Added ${successCount} channels.`);
-    // Save completion state (set to end length)
+    // Save completion state
     PropertiesService.getScriptProperties().setProperty('LAST_PROCESSED_INDEX', allTargetIds.length.toString());
 
   } catch (e) {
+    if (e.message.includes('quota')) {
+      console.error("🛑 QUOTA HIT (General Error). Freezing state.");
+      return;
+    }
     console.error("CRITICAL ERROR: " + e.message);
   }
 }
 
-// Helper: Get list of existing subscriptions to avoid duplicates
+// Helper: Get list of existing subscriptions
+// UPDATED: Now throws error on quota failure instead of swallowing it
 function fetchMyCurrentSubIds() {
   let ids = [];
   let nextPageToken = '';
@@ -142,13 +147,17 @@ function fetchMyCurrentSubIds() {
         ids = ids.concat(response.items.map(item => item.snippet.resourceId.channelId));
       }
       nextPageToken = response.nextPageToken;
-    } catch (e) { break; }
+    } catch (e) {
+      if (e.message.includes('quota')) throw e; // Pass quota error up to main function
+      console.warn("API Warning: " + e.message);
+      break; 
+    }
   } while (nextPageToken);
   return ids;
 }
 
-function createMinuteTrigger(funcName) {
+function createHourlyTrigger(funcName) {
   const triggers = ScriptApp.getProjectTriggers();
   triggers.forEach(t => { if (t.getHandlerFunction() === funcName) ScriptApp.deleteTrigger(t); });
-  ScriptApp.newTrigger(funcName).timeBased().everyMinutes(1).create();
+  ScriptApp.newTrigger(funcName).timeBased().everyHours(5).create();
 }
