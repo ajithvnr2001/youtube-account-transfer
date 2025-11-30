@@ -7,7 +7,7 @@
  * 2. Fetches your YouTube Subscriptions.
  * 3. Writes them to the Sheet.
  * 4. [NEW] SMART RESUME: Handles 5,000+ subscriptions without timing out.
- * 5. [NEW] 1-MINUTE TRIGGER: Runs automatically in small batches.
+ * 5. [NEW] 5-HOUR TRIGGER: Runs automatically 4-5 times a day.
  */
 
 function setupImporter() {
@@ -45,8 +45,8 @@ function setupImporter() {
       DriveApp.getFileById(sheetId).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
     }
     
-    // 2. Create Trigger
-    createMinuteTrigger('runImporterSync');
+    // 2. Create Trigger (Runs every 5 hours)
+    createHourlyTrigger('runImporterSync');
     
     console.log("✅ SETUP COMPLETE");
     console.log("Sheet ID: " + sheetId);
@@ -90,7 +90,7 @@ function runImporterSync() {
       if (new Date().getTime() - startTime > MAX_RUN_TIME) {
         console.warn(`⏳ Time limit reached. Saving bookmark: ${nextPageToken}`);
         PropertiesService.getScriptProperties().setProperty('IMPORTER_PAGE_TOKEN', nextPageToken);
-        return; // Stop and wait for next minute trigger
+        return; // Stop and wait for next trigger
       }
 
       // -- FETCH FROM YOUTUBE --
@@ -137,8 +137,8 @@ function runImporterSync() {
   }
 }
 
-function createMinuteTrigger(funcName) {
+function createHourlyTrigger(funcName) {
   const triggers = ScriptApp.getProjectTriggers();
   triggers.forEach(t => { if (t.getHandlerFunction() === funcName) ScriptApp.deleteTrigger(t); });
-  ScriptApp.newTrigger(funcName).timeBased().everyMinutes(1).create();
+  ScriptApp.newTrigger(funcName).timeBased().everyHours(5).create();
 }
